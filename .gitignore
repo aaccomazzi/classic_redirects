@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# full server logs (large, contain IP addresses); the repo keeps the
+# anonymized samples made by tests/make_log_sample.py
+logs/access_log
+logs/error_log

@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+legacy_handler -- redirect ADS Classic URLs to SciX.
+
+Runs as a CGI script under nginx (through fcgiwrap); nginx sends every
+legacy URL here. Nothing is ever executed locally. The outcome is one of:
+
+  301  the endpoint has a SciX equivalent (REDIRECT_MAP below)
+  302  an htdocs document with no mapping -> the SciX home page
+  404  a cgi-bin script with no mapping, a request for machine-readable
+       output we no longer produce, or a mapped endpoint whose parameters
+       can't be translated (e.g. bib_query without a bibcode)
+
+Configuration (environment variables):
+  SCIX_ENV       "prod" (default) -> https://scixplorer.org
+                 "dev"            -> https://dev.scixplorer.org
+  SCIX_BASE_URL  overrides the base URL entirely (e.g. for testing)
+
+Standard library only; written for Python 3.14 (works on 3.10+).
+"""
+
+import html
+import os
+import re
+import sys
+import traceback
+from dataclasses import dataclass, field
+from urllib.parse import quote
+
+PROD = "https://scixplorer.org"
+DEV = "https://dev.scixplorer.org"
+
+# data types for which classic produced machine-readable output that has
+# no SciX equivalent; these used to be executed locally and are now a 404
+MACHINE_READABLE = {"XML", "RSS", "VOTABLE", "REFMAN", "PORTABLE", "Custom"}
+
+# scripts and parameters that used to be executed locally -> 404
+LOCAL_ONLY_PARAMS = {"abs_connect": ["library"]}
+
+
+def log(msg):
+    print(f"legacy_handler: {msg}", file=sys.stderr)
+
+
+def base_url(env=os.environ):
+    if env.get("SCIX_BASE_URL"):
+        return env["SCIX_BASE_URL"].rstrip("/")
+    return DEV if env.get("SCIX_ENV", "prod").strip().lower() == "dev" else PROD
+
+
+# ---------------------------------------------------------------------------
+# Encoding helpers.
+# Strings are handled as latin-1 "byte strings" (one char per byte), as the
+# Perl script did, so that non-ASCII input round-trips byte for byte.
+
+_PCT = re.compile(r"%([0-9A-Fa-f]{2})")
+_ESCAPE = re.compile(r'[\x00-\x20"#%/;<>?\x7f-\xff]')
+_UNSAFE = re.compile(r"[^\x21-\x7e]")
+
+
+def as_bytestr(s):
+    """environment str (utf-8 + surrogateescape) -> latin-1 byte string"""
+    return s.encode("utf-8", "surrogateescape").decode("latin-1")
+
+
+def unescape(s):
+    return _PCT.sub(lambda m: chr(int(m.group(1), 16)), s)
+
+
+def escape(s):
+    """URL-encode a path component (same character set as the Perl escape())"""
+    return _ESCAPE.sub(lambda m: "%%%02x" % ord(m.group()), s)
+
+
+def safe_url(url):
+    """make sure nothing but printable ASCII ends up in a Location header"""
+    return _UNSAFE.sub(lambda m: "%%%02X" % ord(m.group()), url)
+
+
+def qsencode(params):
+    return "&".join(f"{escape(k)}={escape(v)}" for k, v in params.items())
+
+
+# a 19-character bibcode whose "&" was not URL-encoded, either as the value of
+# "bibcode=" or as a bare leading parameter, e.g.
+#   nph-data_query?bibcode=2016A&A...590A.124R&link_type=ARTICLE
+#   bib_query?2018A&A...610A..71T
+_BIB_AMP = re.compile(r"(^|bibcode=)(\d{4}[\w.]{1,4})&([\w.]+)", re.ASCII)
+
+
+def fix_bibcode_amp(raw):
+    def fix(m):
+        if len(m.group(2)) + 1 + len(m.group(3)) == 19:
+            return f"{m.group(1)}{m.group(2)}%26{m.group(3)}"
+        return m.group(0)
+    return _BIB_AMP.sub(fix, raw)
+
+
+def parse_params(raw, method):
+    """Port of ReadParse: split on & (or &amp;), + -> space, %XX decoding,
+    repeated keys joined with \\0."""
+    if method in ("GET", "HEAD"):
+        raw = fix_bibcode_amp(raw)
+    params = {}
+    for item in re.split(r"&(?:amp;)?", raw):
+        if not item:
+            continue
+        key, _, val = item.replace("+", " ").partition("=")
+        key, val = unescape(key), unescape(val)
+        if key.startswith("amp;"):  # "&amp%3Bkey=..." (encoded &amp;)
+            key = key[4:]
+        params[key] = params[key] + "\0" + val if key in params else val
+    return params
+
+
+# ---------------------------------------------------------------------------
+# The request
+
+@dataclass
+class Request:
+    method: str = "GET"
+    endpoint: str = ""       # script name (cgi-bin) or first path segment (htdocs)
+    path_info: str = ""      # whatever follows the endpoint in the path
+    qs: str = ""             # raw query string (or POST body)
+    is_cgi: bool = False     # under /cgi-bin/ ?
+    params: dict = field(default_factory=dict)
+
+
+def clean_script(name):
+    """'nph-bib_query', ' nph-bib_query', 'nph-%0Abib_query' -> 'bib_query'"""
+    name = re.sub(r"\s+", "", name)
+    return name[4:] if name.startswith("nph-") else name
+
+
+def request_from_env(env, stdin=None):
+    method = env.get("REQUEST_METHOD", "GET").upper()
+    uri = env.get("REQUEST_URI")
+    if uri is None:
+        uri = env.get("DOCUMENT_URI", env.get("SCRIPT_NAME", "") + env.get("PATH_INFO", ""))
+    path = unescape(as_bytestr(uri.split("?", 1)[0]))
+    path = re.sub(r"^/{2,}", "/", path)  # "//cgi-bin/..." (keep "https://" in path_info)
+
+    req = Request(method=method)
+    if path == "/cgi-bin" or path.startswith("/cgi-bin/"):
+        req.is_cgi = True
+        seg, _, tail = path[len("/cgi-bin/"):].partition("/")
+        req.endpoint = clean_script(seg)
+    else:
+        seg, _, tail = path.lstrip("/").partition("/")
+        req.endpoint = seg
+    req.path_info = "/" + tail if tail else ""
+
+    if method == "POST" and stdin is not None:
+        length = int(env.get("CONTENT_LENGTH") or 0)
+        req.qs = stdin.read(length).decode("latin-1") if length > 0 else ""
+    else:
+        req.qs = as_bytestr(env.get("QUERY_STRING", ""))
+    req.params = parse_params(req.qs, method)
+    return req
+
+
+# ---------------------------------------------------------------------------
+# Mapping functions: each takes a Request and returns a URL, or None when
+# the request can't be translated (-> 404).
+
+def bib_extract(params):
+    """bibcode from ?bibcode=<bibcode>&... or ?<bibcode>&...;
+    returns (bibcode, remaining params).  Also repairs two common breakages
+    seen in the logs:
+      ?link_type=ABSTRACTbibcode=<bibcode>        (missing "&")
+      ?A...415..145B&bibcode=2004A&link_type=...  (unencoded "&" in A&A)"""
+    params = dict(params)
+    bibcode = ""
+    if params.get("bibcode"):
+        bibcode = params.pop("bibcode")
+    else:
+        for k, v in params.items():
+            if v == "" and k != "bibcode":
+                bibcode = k
+                del params[k]
+                break
+        else:
+            for k, v in params.items():
+                m = re.search(r"bibcode=(\S+)$", v)
+                if m:
+                    bibcode = m.group(1)
+                    params[k] = v[:m.start()]
+                    break
+    bibcode = bibcode.strip(" \t\r\n")
+    if 0 < len(bibcode) < 19:
+        for k, v in params.items():
+            if v == "" and len(bibcode) + 1 + len(k) == 19:
+                bibcode = f"{bibcode}&{k}"
+                del params[k]
+                break
+    return bibcode, params
+
+
+def fixed(url):
+    """always redirect to the same URL (Perl: nopath)"""
+    return lambda req: url
+
+
+def passthrough(url, noparams=None):
+    """url + path_info + ?query_string; `noparams` if there are neither"""
+    def rule(req):
+        tail = req.path_info + (f"?{req.qs}" if req.qs else "")
+        return noparams if (noparams and not tail) else url + tail
+    return rule
+
+
+def bibpath(url):
+    """/abs/<id>, /doi/<doi>, /arXiv/<id> -> <url>/<id>[/abstract]"""
+    def rule(req):
+        qp = req.path_info.replace("&amp;", "&")
+        if qp.strip("/") == "":
+            # /abs?<bibcode> or /abs?bibcode=<bibcode>
+            bib, _ = bib_extract(req.params)
+            if not bib:
+                return None
+            qp = "/" + bib
+        if "/" not in qp[1:]:
+            qp += "/abstract"
+        return url + qp
+    return rule
+
+
+def bib2abs(url):
+    """bib_query?<bibcode>&... -> /abs/<bibcode>?<other params>"""
+    def rule(req):
+        bib, rest = bib_extract(req.params)
+        if not bib:
+            return None
+        qs = qsencode(rest)
+        return f"{url}/{escape(bib)}" + (f"?{qs}" if qs else "")
+    return rule
+
+
+def ref2abs(url):
+    """ref_query?bibcode=X&refs=... -> /abs/X/(citations|references|coreads)"""
+    types = {"citations": "citations", "references": "references", "ar": "coreads"}
+
+    def rule(req):
+        bib, rest = bib_extract(req.params)
+        if not bib:
+            return None
+        kind = types.get(rest.get("refs", "").lower(), "citations")
+        return f"{url}/{escape(bib)}/{kind}"
+    return rule
+
+
+def refhist2abs(url):
+    """ref_history?refs=AR&bibcode=X -> /abs/X/metrics"""
+    def rule(req):
+        bib, _ = bib_extract(req.params)
+        return f"{url}/{escape(bib)}/metrics" if bib else None
+    return rule
+
+
+def data2resolver(url):
+    """data_query?bibcode=X&link_type=T -> /link_gateway/X/<t>"""
+    types = {
+        "abstract": "abstract", "citations": "citations", "data": "data",
+        "ejournal": "pub_html", "article": "article", "gif": "ads_scan",
+        "spires": "inspire", "library": "librarycatalog", "video": "presentation",
+        "ned": "ned", "associated": "associated", "pds": "pds",
+        "references": "references", "simbad": "simbad", "toc": "toc",
+        "ar": "coreads", "preprint": "eprint_html",
+    }
+
+    def rule(req):
+        bib, rest = bib_extract(req.params)
+        if not bib:
+            return None
+        kind = types.get(rest.get("link_type", "").lower(), "")
+        return f"{url}/{escape(bib)}" + (f"/{kind}" if kind else "")
+    return rule
+
+
+_BIBCODE = re.compile(r"^\d{4}\S{15}$")
+
+
+def scan_search(url, terms):
+    q = " AND ".join(terms)
+    return f"{url}/search?q={quote(q, safe='')}"
+
+
+def _volume(v):
+    v = v.strip().strip(".")
+    return str(int(v)) if v.isdigit() else v
+
+
+def full2scan(url):
+    """Article service /full URLs -> scan explorer:
+         /full/<bibcode>[/...]          -> /scan/manifest/<bibcode>?art=true
+         /full/seri/<J>/<vol>/<page>... -> /scan/search?q=bibstem:J AND volume:V AND page:P
+    """
+    def rule(req):
+        segs = [s for s in req.path_info.replace("&amp;", "&").split("/") if s]
+        if len(segs) >= 4 and segs[0] == "seri":
+            journal, vol, page = segs[1].strip("."), _volume(segs[2]), segs[3]
+            page = re.match(r"\d*", page).group().lstrip("0")
+            terms = [f"bibstem:{journal}"] if journal else []
+            terms += [f"volume:{vol}"] if vol else []
+            terms += [f"page:{page}"] if page else []
+            return scan_search(url, terms) if terms else None
+        for s in segs:  # /full/<bibcode>, /full/gif/<bibcode>/..., etc.
+            if _BIBCODE.match(s):
+                return f"{url}/manifest/{escape(s)}?art=true"
+        return None
+    return rule
+
+
+def iarticle2scan(url):
+    """iarticle_query / article_query -> /scan/search?q=...
+         ?bibcode=X[&page=P]               -> bibcode:X [AND page:P]
+         ?journal=J&volume=V[&page_ind=N]  -> bibstem:J AND volume:V [AND page_sequence:N+1]
+    page_ind is ignored for bibcode queries: it is an offset within the
+    article, which the scan explorer can't express."""
+    def rule(req):
+        bib, p = bib_extract(req.params)
+        terms = []
+        if bib:
+            terms.append(f"bibcode:{bib}")
+        elif p.get("journal", "").strip(" ."):
+            terms.append(f"bibstem:{p['journal'].strip(' .')}")
+            if _volume(p.get("volume", "")):
+                terms.append(f"volume:{_volume(p['volume'])}")
+            if p.get("page_ind", "").strip().isdigit():
+                terms.append(f"page_sequence:{int(p['page_ind']) + 1}")
+        else:
+            return None
+        if p.get("page", "").strip().isdigit():
+            terms.append(f"page:{int(p['page'])}")
+        return scan_search(url, terms)
+    return rule
+
+
+def account(url):
+    """manage_account?man_cmd=... -> SciX account pages"""
+    cmds = {"login": "/user/account/login", "register": "/user/account/register"}
+
+    def rule(req):
+        cmd = req.params.get("man_cmd", "").lower()
+        return url + cmds.get(cmd, "/user/settings")
+    return rule
+
+
+def ads_harvard(seg):
+    """/local/..., /mirror/... etc. (formerly in htdocs.htaccess)"""
+    def rule(req):
+        return f"http://ads.harvard.edu/{seg}" + (req.path_info or "/")
+    return rule
+
+
+# ---------------------------------------------------------------------------
+# Redirect map: endpoint -> rule
+
+def build_redirect_map(base):
+    classic = f"{base}/classic-form/"
+    modern = fixed(base)
+    classic_form = fixed(classic)
+    paper_form = fixed(f"{base}/paper-form/")
+    abs_path = bibpath(f"{base}/abs")
+    tugboat = f"{base}/tugboat/classicSearchRedirect"
+    scan = f"{base}/scan"
+
+    rmap = {
+        # cgi-bin scripts
+        "abs_connect": passthrough(tugboat, noparams=classic),
+        "basic_connect": passthrough(tugboat, noparams=base),
+        "bib_query": bib2abs(f"{base}/abs"),
+        "data_query": data2resolver(f"{base}/link_gateway"),
+        "ref_query": ref2abs(f"{base}/abs"),
+        "ref_history": refhist2abs(f"{base}/abs"),
+        "iarticle_query": iarticle2scan(scan),
+        "article_query": iarticle2scan(scan),
+        "manage_account": account(base),
+        "myads_set": fixed(f"{base}/user/notifications"),
+        "myads2_set": fixed(f"{base}/user/notifications"),
+        "exec_myads2": fixed(f"{base}/user/notifications"),
+
+        # htdocs
+        "abs": abs_path,
+        "doi": abs_path,
+        "arXiv": abs_path,
+        "full": full2scan(scan),
+        "": modern,
+        "index.html": modern,
+        "mighty_search.html": modern,
+        "adsug.html": fixed("http://adsabs.github.io/about/adsug/"),
+    }
+    for page in ("abstract", "physics", "preprint", "general", "education", "default"):
+        rmap[f"{page}_service.html"] = classic_form
+    for page in ("basic_search.html", "basic_service.html", "quick_service.html",
+                 "fulltext_service.html", "advanced_fulltext_service.html"):
+        rmap[page] = modern
+    for page in ("ast_bib.html", "pre_bib.html", "gen_bib.html", "phy_bib.html",
+                 "custom_bib.html", "bib_abs.html"):
+        rmap[page] = paper_form
+    for seg in ("local", "mirror", "z3950", "www", "books", "BOBeo", "pubs", "cfa"):
+        rmap[seg] = ads_harvard(seg)
+    return rmap
+
+
+# ---------------------------------------------------------------------------
+# Dispatch and response
+
+def handle(req, base):
+    """returns (status, url)"""
+    rmap = build_redirect_map(base)
+    if req.is_cgi:
+        data_types = req.params.get("data_type", "").split("\0")
+        if any(t in MACHINE_READABLE for t in data_types):
+            log(f"machine-readable output requested ({req.params['data_type']!r}), not available")
+            return 404, None
+        for p in LOCAL_ONLY_PARAMS.get(req.endpoint, []):
+            if p in req.params:
+                log(f"script {req.endpoint!r} with param {p!r} is no longer supported")
+                return 404, None
+
+    rule = rmap.get(req.endpoint)
+    if rule is not None:
+        url = rule(req)
+        if url is None:
+            log(f"endpoint {req.endpoint!r}: parameters can't be translated")
+            return 404, None
+        return 301, safe_url(url)
+    if req.is_cgi:
+        log(f"no redirection for script {req.endpoint!r}")
+        return 404, None
+    log(f"no redirection for document {req.endpoint!r}, sending to the home page")
+    return 302, base
+
+
+STATUS_TEXT = {301: "Moved Permanently", 302: "Found", 404: "Not Found"}
+
+
+def respond(status, url, method, out):
+    headers = [f"Status: {status} {STATUS_TEXT[status]}", "Content-Type: text/html; charset=utf-8"]
+    if url:
+        headers.append(f"Location: {url}")
+        h = html.escape(url)
+        body = (f"<html><head><title>Document Moved</title></head><body><h1>Document Moved</h1>"
+                f"<p>The document is available at <a href=\"{h}\">{h}</a></p></body></html>\r\n")
+    else:
+        body = ("<html><head><title>Not Found</title></head><body><h1>Not Found</h1>"
+                "<p>The requested URL is no longer available.</p></body></html>\r\n")
+    out.write(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+    if method != "HEAD":
+        out.write(body.encode("utf-8"))
+    out.flush()
+
+
+def main():
+    env = os.environ
+    base = base_url(env)
+    method = env.get("REQUEST_METHOD", "GET").upper()
+    try:
+        req = request_from_env(env, sys.stdin.buffer)
+        log(f"{'cgi-bin script' if req.is_cgi else 'document'} {req.endpoint!r}, "
+            f"path {req.path_info!r}, query {req.qs!r}")
+        status, url = handle(req, base)
+    except Exception:
+        log("unexpected error, redirecting home:\n" + traceback.format_exc())
+        status, url = 302, base
+    if url:
+        log(f"{status} redirect to {url}")
+    else:
+        log(f"{status}")
+    respond(status, url, method, sys.stdout.buffer)
+
+
+if __name__ == "__main__":
+    main()

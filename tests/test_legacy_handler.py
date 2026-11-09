@@ -38,9 +38,25 @@ class Redirects(unittest.TestCase):
 
     def test_search_scripts(self):
         self.check("/cgi-bin/basic_connect?qsearch=10.1126%2Fscience.1087251",
-                   f"{B}/tugboat/classicSearchRedirect?qsearch=10.1126%2Fscience.1087251")
-        self.check("/cgi-bin/nph-abs_connect?author=Accomazzi",
-                   f"{B}/tugboat/classicSearchRedirect?author=Accomazzi")
+                   f"{B}/search?q=doi:%2210.1126/science.1087251%22&sort=date%20desc,%20bibcode%20desc")
+        self.check("/cgi-bin/nph-abs_connect?author=Accomazzi,+A&db_key=AST&jou_pick=NO&sort=CITATIONS&version=1",
+                   f"{B}/search?filter_database_fq_database=OR"
+                   "&filter_database_fq_database=database:%22astronomy%22"
+                   "&filter_property_fq_property=AND&filter_property_fq_property=property:%22refereed%22"
+                   "&q=author:(%22Accomazzi,%20A%22)"
+                   "&fq=%7B!type=aqp%20v=$fq_database%7D&fq_database=(database:%22astronomy%22)"
+                   "&fq=%7B!type=aqp%20v=$fq_property%7D&fq_property=(property:(%22refereed%22))"
+                   "&sort=citation_count%20desc")
+        self.check("/cgi-bin/basic_connect?qsearch=2018A%26A...610A..71T",
+                   f"{B}/search?q=bibcode:%222018A%26A...610A..71T%22&sort=date%20desc,%20bibcode%20desc")
+        # repeated db_key values are combined, UTF-8 is decoded
+        self.check("/cgi-bin/abs_connect?db_key=AST&db_key=PHY&author=G%C3%BCsten",
+                   f"{B}/search?filter_database_fq_database=OR"
+                   "&filter_database_fq_database=database:%22astronomy%22"
+                   "&filter_database_fq_database=database:%22physics%22"
+                   "&q=author:(%22G%C3%BCsten%22)"
+                   "&fq=%7B!type=aqp%20v=$fq_database%7D&fq_database=(database:%22astronomy%22%20OR%20database:%22physics%22)"
+                   "&sort=date%20desc,%20bibcode%20desc")
         self.check("/cgi-bin/abs_connect", f"{B}/classic-form/")
         self.check("/cgi-bin/basic_connect", B)
 
@@ -105,7 +121,7 @@ class Redirects(unittest.TestCase):
     def test_account(self):
         self.check("/cgi-bin/nph-manage_account?man_cmd=login&man_url=x", f"{B}/user/account/login")
         self.check("/cgi-bin/manage_account?man_cmd=register", f"{B}/user/account/register")
-        self.check("/cgi-bin/nph-manage_account", f"{B}/user/settings")
+        self.check("/cgi-bin/nph-manage_account", f"{B}/user/settings/application")
         self.check("/cgi-bin/myads2_set", f"{B}/user/notifications")
 
     def test_forms_and_pages(self):
@@ -162,7 +178,10 @@ class CGI(unittest.TestCase):
 
     def test_post(self):
         h, _ = self.run_cgi("/cgi-bin/nph-abs_connect", method="POST", body=b"author=Accomazzi&db_key=AST")
-        self.assertEqual(h["Location"], f"{B}/tugboat/classicSearchRedirect?author=Accomazzi&db_key=AST")
+        self.assertEqual(h["Location"], f"{B}/search?filter_database_fq_database=OR"
+                         "&filter_database_fq_database=database:%22astronomy%22&q=author:(%22Accomazzi%22)"
+                         "&fq=%7B!type=aqp%20v=$fq_database%7D&fq_database=(database:%22astronomy%22)"
+                         "&sort=date%20desc,%20bibcode%20desc")
 
     def test_dev(self):
         h, _ = self.run_cgi("/full/1990ApJ...365..704S", SCIX_ENV="dev")

@@ -7,14 +7,15 @@
        7  /bib_abs.html: 301 same
        8  /books: 301 DIFFERENT
        1  /cfa: 301 DIFFERENT
-     760  /cgi-bin/abs_connect: 301 same
+       1  /cgi-bin/abs_connect: 301 same
+     759  /cgi-bin/abs_connect: 301 tugboat -> search
      834  /cgi-bin/abs_connect: perl 299 -> python 404
        1  /cgi-bin/abs_query: perl 299 -> python 404
        1  /cgi-bin/access_denied: perl 299 -> python 404
        4  /cgi-bin/article: perl 299 -> python 404
        6  /cgi-bin/article_query: perl 299 -> python 301
      409  /cgi-bin/author_form: perl 299 -> python 404
-    2500  /cgi-bin/basic_connect: 301 same
+    2500  /cgi-bin/basic_connect: 301 tugboat -> search
        6  /cgi-bin/bib_query: 301 DIFFERENT
     2494  /cgi-bin/bib_query: 301 same
        1  /cgi-bin/css: perl 299 -> python 404
@@ -1223,7 +1224,7 @@
 /cgi-bin/manage_account
   uri:    /cgi-bin/nph-manage_account
   perl:   [299] None
-  python: https://scixplorer.org/user/settings
+  python: https://scixplorer.org/user/settings/application
 /cgi-bin/manage_account
   uri:    /cgi-bin/nph-manage_account?man_cmd=login&man_url=https://articles.adsabs.harvard.edu/cgi-bin/iarticle%5fquery%3fbibcode%3d1927PGro...41....1K%26db%5fkey%3dAST%26page%5find%3d13%26plate%5fselect%3dNO%26data%5ftype%3dGIF%26type%3dSCREEN%5fGIF%26classic%3dYES
   perl:   [299] None
@@ -2295,7 +2296,7 @@
 /cgi-bin/manage_account
   uri:    /cgi-bin/nph-manage_account/
   perl:   [299] None
-  python: https://scixplorer.org/user/settings
+  python: https://scixplorer.org/user/settings/application
 /cgi-bin/manage_account
   uri:    /cgi-bin/nph-manage_account?man_cmd=login&man_url=https://articles.adsabs.harvard.edu/cgi-bin/iarticle%5fquery%3fbibcode%3d1904AnBor..11....1E%26db%5fkey%3dAST%26page%5find%3d235%26plate%5fselect%3dNO%26data%5ftype%3dGIF%26type%3dSCREEN%5fGIF%26classic%3dYES
   perl:   [299] None

@@ -27,6 +27,10 @@ import traceback
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
+# classic search translation (port of tugboat), in the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import classic_search  # noqa: E402
+
 PROD = "https://scixplorer.org"
 DEV = "https://dev.scixplorer.org"
 
@@ -201,6 +205,24 @@ def fixed(url):
     return lambda req: url
 
 
+def search(base, noparams):
+    """abs_connect / basic_connect -> SciX search page, translating the classic
+    search parameters (see classic_search.py); `noparams` if there are none"""
+    def rule(req):
+        if not req.qs:
+            return noparams
+        multi = {}
+        for k, v in req.params.items():
+            key = k.encode("latin-1").decode("utf-8", "replace")
+            vals = [x.encode("latin-1").decode("utf-8", "replace") for x in v.split("\0")]
+            multi.setdefault(key, []).extend(vals)
+        url, notes = classic_search.search_url(base, multi)
+        for n in notes:
+            log(f"classic search: {n}")
+        return url
+    return rule
+
+
 def passthrough(url, noparams=None):
     """url + path_info + ?query_string; `noparams` if there are neither"""
     def rule(req):
@@ -342,7 +364,7 @@ def account(url):
 
     def rule(req):
         cmd = req.params.get("man_cmd", "").lower()
-        return url + cmds.get(cmd, "/user/settings")
+        return url + cmds.get(cmd, "/user/settings/application")
     return rule
 
 
@@ -362,13 +384,12 @@ def build_redirect_map(base):
     classic_form = fixed(classic)
     paper_form = fixed(f"{base}/paper-form/")
     abs_path = bibpath(f"{base}/abs")
-    tugboat = f"{base}/tugboat/classicSearchRedirect"
     scan = f"{base}/scan"
 
     rmap = {
         # cgi-bin scripts
-        "abs_connect": passthrough(tugboat, noparams=classic),
-        "basic_connect": passthrough(tugboat, noparams=base),
+        "abs_connect": search(base, noparams=classic),
+        "basic_connect": search(base, noparams=base),
         "bib_query": bib2abs(f"{base}/abs"),
         "data_query": data2resolver(f"{base}/link_gateway"),
         "ref_query": ref2abs(f"{base}/abs"),

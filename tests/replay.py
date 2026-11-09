@@ -143,7 +143,13 @@ def main():
                 (pstatus, purl), _ = run_python(u)
                 ostatus, ourl = run_perl(u, cgi, docs)
                 key = f"{'/cgi-bin/' if is_cgi else '/'}{ep}"
-                if ostatus == 301 and pstatus == 301:
+                if ostatus == 301 and pstatus == 301 and "/tugboat/classicSearchRedirect" in (ourl or ""):
+                    # translated here now instead of by tugboat (see tests/compare_tugboat.py)
+                    ok = purl.startswith(NEW_BASE + "/search?")
+                    results[f"{key}: 301 tugboat -> {'search' if ok else 'UNEXPECTED'}"] += 1
+                    if not ok:
+                        diffs.append((key, u, ourl, purl))
+                elif ostatus == 301 and pstatus == 301:
                     same = norm(ourl) == norm(purl)
                     results[f"{key}: 301 {'same' if same else 'DIFFERENT'}"] += 1
                     if not same:

@@ -9,8 +9,11 @@ ran under Apache; see `REQUIREMENTS.md` for the background and requirements.
 | Path | What it is |
 |---|---|
 | `cgi-bin/legacy_handler` | The handler: a single Python 3.14 CGI script, standard library only |
+| `cgi-bin/classic_search.py` | Translation of classic search parameters into a SciX search (a port of tugboat), imported by the handler |
 | `nginx/classic_redirects.conf` | Sample nginx + fcgiwrap configuration |
-| `tests/test_legacy_handler.py` | Unit tests |
+| `tests/test_legacy_handler.py` | Unit tests for the handler |
+| `tests/test_classic_search.py` | tugboat's unit tests for the search translation, run against `classic_search.py` |
+| `tests/compare_tugboat.py` | Compares `classic_search.py` with tugboat itself on the logged search requests |
 | `tests/replay.py` | Replays `logs/access_log` through the old Perl handler and the new one and reports differences |
 | `tests/replay_report.txt` | Output of the last replay |
 | `legacy/legacy_handler.pl` | The original Perl handler, kept for reference and used by the replay |
@@ -38,7 +41,8 @@ Requirements:
 
 * Python 3.14 as `python3` on the PATH of the fcgiwrap user (the script uses
   `#!/usr/bin/env python3`; it also runs on 3.10+). No third-party packages.
-* `cgi-bin/legacy_handler` must be executable.
+* `cgi-bin/legacy_handler` must be executable, and `cgi-bin/classic_search.py`
+  must sit next to it (the handler imports it from its own directory).
 * nginx must pass `REQUEST_URI`, `QUERY_STRING`, `REQUEST_METHOD` and
   `CONTENT_LENGTH` (the stock `fastcgi_params` does). The handler reads the
   path from `REQUEST_URI`, falling back to `DOCUMENT_URI` or
@@ -87,8 +91,8 @@ Paths are relative to the SciX base URL unless shown in full.
 
 | Classic | SciX |
 |---|---|
-| `/cgi-bin/abs_connect?...` | `/tugboat/classicSearchRedirect?...` (no query: `/classic-form/`) |
-| `/cgi-bin/basic_connect?...` | `/tugboat/classicSearchRedirect?...` (no query: home page) |
+| `/cgi-bin/abs_connect?...` | `/search?q=...` (see [Classic search translation](#classic-search-translation); no query: `/classic-form/`) |
+| `/cgi-bin/basic_connect?...` | `/search?q=...` (no query: home page) |
 | `/cgi-bin/bib_query?<bibcode>&...` | `/abs/<bibcode>?<remaining params>` |
 | `/cgi-bin/data_query?bibcode=X&link_type=T` | `/link_gateway/X/<t>` (type mapping below) |
 | `/cgi-bin/ref_query?bibcode=X&refs=T` | `/abs/X/citations`, `/abs/X/references` or `/abs/X/coreads` (default `citations`) |
@@ -96,7 +100,7 @@ Paths are relative to the SciX base URL unless shown in full.
 | `/cgi-bin/iarticle_query?...`, `/cgi-bin/article_query?...` | `/scan/search?q=...` (see [Scan explorer](#scan-explorer)) |
 | `/cgi-bin/manage_account?man_cmd=login` | `/user/account/login` |
 | `/cgi-bin/manage_account?man_cmd=register` | `/user/account/register` |
-| `/cgi-bin/manage_account` (anything else) | `/user/settings` |
+| `/cgi-bin/manage_account` (anything else) | `/user/settings/application` |
 | `/cgi-bin/myads_set`, `myads2_set`, `exec_myads2` | `/user/notifications` |
 | `/abs/<id>`, `/arXiv/<id>`, `/abs?bibcode=<id>` | `/abs/<id>/abstract` (path kept as is if it already has a sub-page) |
 | `/doi/<doi>` | `/abs/<doi>` |
@@ -148,6 +152,62 @@ For example
 
 `/full/seri/<J>/<vol>/<page>` URLs (e.g. `/full/seri/ApJ../0365/0000704.000.html`)
 become a search on `bibstem`, `volume` and `page` with the same cleanup.
+
+### Classic search translation
+
+`abs_connect` (the classic search forms) and `basic_connect` (the single-box
+search) used to be redirected to tugboat's `/tugboat/classicSearchRedirect`,
+which translated the classic parameters into a Solr query and redirected to
+the search page. `cgi-bin/classic_search.py` is a port of that translation
+(`ClassicSearchRedirectView` in
+[tugboat/views.py](https://github.com/adsabs/tugboat/blob/master/tugboat/views.py)),
+so these requests now go straight to the SciX search page in one redirect
+instead of three (handler → tugboat → `/search/q=...` → `/search?q=...`).
+
+For example `basic_connect?qsearch=10.1126%2Fscience.1087251` →
+`/search?q=doi:%2210.1126/science.1087251%22&sort=date%20desc,%20bibcode%20desc`, and
+
+    abs_connect?author=Accomazzi,+A&db_key=AST&jou_pick=NO&sort=CITATIONS
+
+→ `/search?` with
+
+| Parameter | Value |
+|---|---|
+| `filter_database_fq_database` | `OR`, `database:"astronomy"` (facet display) |
+| `filter_property_fq_property` | `AND`, `property:"refereed"` |
+| `q` | `author:("Accomazzi, A")` |
+| `fq`, `fq_database` | `{!type=aqp v=$fq_database}`, `(database:"astronomy")` |
+| `fq`, `fq_property` | `{!type=aqp v=$fq_property}`, `(property:("refereed"))` |
+| `sort` | `citation_count desc` |
+
+What is translated, as in tugboat: authors (with `aut_logic`, exact matching
+via `aut_xct`, and `^last, first` first-author syntax), title, abstract text,
+objects, bibcode, publication dates (2-digit years are read as the most
+recent matching year, at most next year), entry dates (absolute or
+offsets), databases (`db_key`, `db_key2`), refereed status (`jou_pick`),
+bibliographic groups (`group_sel`/`group_and`), article type, arXiv classes,
+data links (`data_link`, `gif_link`, ... with `data_and`), bibstems
+(`ref_stems`, `bibstem`), `year`, `volume`, `page`, sort order, the six
+myADS query types (`query_type`), and `qsearch`, which recognises bibcodes,
+`title:`/`author:` prefixes, DOIs and years before falling back to free text.
+
+Differences from tugboat:
+
+* The query string is built in its final form, `/search?q=...`; tugboat built
+  a Bumblebee-style `/search/q=.../` path that SciX then rewrites.
+* tugboat appended `error_message`, `warning_message` and
+  `unprocessed_parameter` notes to the URL; SciX doesn't show them, so the
+  handler logs them instead (`legacy_handler: classic search: unprocessed: ...`).
+* myADS keyword queries (`query_type=ALSOREADS|REFS|PAPERS` with a title)
+  wrap the keywords in parentheses, e.g. `trending(instrumentation)`.
+  tugboat meant to do this with the ADS parser library, but that call
+  always failed under Python 3 and the fallback produced broken queries
+  such as `trendinginstrumentation`.
+* Classic parameters are parsed by the handler, so the repairs described
+  under [Repairs of malformed URLs](#repairs-of-malformed-urls) apply
+  (e.g. `&amp;`-separated parameters are understood; tugboat ignored them).
+* Standard library only: tugboat's Flask/webargs parsing, `dateutil` and the
+  ADS parser library are not needed.
 
 ## Implementation
 
@@ -215,7 +275,8 @@ can't be translated (which becomes a 404). Rules are built by small factories:
 | Factory | Behaviour | Perl equivalent |
 |---|---|---|
 | `fixed(url)` | always `url` | `nopath` |
-| `passthrough(url, noparams)` | `url` + path + `?query`; `noparams` if both are empty | no `map` + `noparams` |
+| `search(base, noparams)` | `abs_connect`, `basic_connect` → `/search?...` via `classic_search.search_url()`; `noparams` if there is no query | tugboat |
+| `passthrough(url, noparams)` | `url` + path + `?query`; `noparams` if both are empty (not used at present) | no `map` + `noparams` |
 | `bibpath(url)` | `/abs`, `/doi`, `/arXiv` identifiers | `bibpath` |
 | `bib2abs(url)` | `bib_query` | `bib2abspath` |
 | `ref2abs(url)` | `ref_query` | `ref2abspath` |
@@ -269,6 +330,8 @@ client gets a 302 to the home page, so a bug never produces a broken page.
   being served through `insert_login`.
 * New rules for `/full`, `iarticle_query`/`article_query`, `manage_account`
   and the myADS scripts.
+* `abs_connect` and `basic_connect` are translated into a SciX search here
+  instead of being passed to tugboat.
 * The redirects from `htdocs.htaccess` moved into the handler.
   `mighty_search.html` goes to the home page, as the `.htaccess` rule did.
 * The `debug` parameter, which printed the server environment, is gone.
@@ -289,6 +352,17 @@ python3 tests/replay.py --out tests/replay_report.txt   # replay against the Per
 The unit tests call the handler's functions directly and also run it as a CGI
 process (GET, HEAD, POST, `SCIX_ENV=dev`, 404 and 302).
 
+`tests/test_classic_search.py` holds tugboat's 45 translation tests, with
+their bodies unchanged; a small shim rebuilds the string tugboat returned so
+the original assertions apply. One expectation was updated: a 2-digit entry
+year `26` meant 1926 when the test was written (2023) and means 2026 now.
+
+`tests/compare_tugboat.py` runs every logged `abs_connect`/`basic_connect`
+request through tugboat itself and through `classic_search.py` (see the
+script for how to set up tugboat). On the November 8, 2026 log, all 26,253
+unique search URLs translate identically, except one myADS query that now
+gets its parentheses (see above).
+
 `tests/replay.py` takes the unique URLs in `logs/access_log` (or
 `logs/access_log.sample` when the full log isn't there; `--log` picks another file), up to
 `--per-endpoint` (default 1500) per endpoint, and runs each through both
@@ -297,7 +371,9 @@ the old server, with stub scripts standing in for the local programs. The
 Perl targets are rewritten from `ui.adsabs.harvard.edu` to `scixplorer.org`,
 and query parameters are compared without regard to order. The report counts
 outcomes per endpoint (`301 same`, `301 DIFFERENT`, `perl 299 -> python 404`,
-where 299 means "Perl executed a local program") and lists every difference.
+where 299 means "Perl executed a local program"; `301 tugboat -> search` for
+searches that used to go to tugboat and are now translated here) and lists
+every difference.
 On the November 8, 2026 logs, every difference is either one of the
 intended rule changes above or a repaired malformed URL.
 
@@ -327,10 +403,14 @@ python3 tests/make_log_sample.py [--per-endpoint 25] [--error-lines 1000]
 
 ## Open points
 
-* The SciX paths `/tugboat/classicSearchRedirect`, `/classic-form/` and
-  `/paper-form/` are carried over from the ADS user interface, and the account
-  paths (`/user/account/login`, `/user/account/register`, `/user/settings`,
-  `/user/notifications`) are assumed. All of them should be checked on
-  scixplorer.org.
+* The SciX paths used here (`/search`, `/abs`, `/link_gateway`,
+  `/classic-form`, `/paper-form`, `/user/account/login`,
+  `/user/account/register`, `/user/settings/application`,
+  `/user/notifications`) were checked against the SciX front-end source
+  ([adsabs/nectar](https://github.com/adsabs/nectar)) in November 2026, not
+  against the live site.
+* The `filter_*` facet parameters in translated searches follow tugboat's
+  Bumblebee conventions; SciX's own code handles the `fq_*` filters, and
+  should be checked to display the facets the same way.
 * The mapping of `page_ind` to `page_sequence` assumes the scan explorer's
   sequence numbers start at 1.
